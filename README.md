@@ -36,6 +36,7 @@ npm run build:extension
 ```
 
 4. Load the extension in Chrome:
+   
    - Open Chrome and navigate to `chrome://extensions/`
    - Enable "Developer mode"
    - Click "Load unpacked"
