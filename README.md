@@ -1,4 +1,4 @@
-# Braiser
+# Braiser AI
 AI-based browser automation tool for Chrome
 
 A chrome extension which allows the user give an AI arbitrary tasks, which the AI then attempts to complete autonomously by controlling a browser tab. Built with the help of o1 and Claude 3.5.
