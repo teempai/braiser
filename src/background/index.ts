@@ -197,6 +197,23 @@ class BackgroundService {
         }]
       });
   
+      // Handle new actions
+      if (action.type === 'STORE') {
+        // STORE is handled by AIClient, no need for additional processing
+        return;
+      }
+  
+      if (action.type === 'PRINT') {
+        this.updateExecutionState({
+          logs: [...this.executionState.logs, {
+            type: 'info',
+            message: action.payload.text,
+            timestamp: new Date().toISOString()
+          }]
+        });
+        return;
+      }
+  
       // For navigation actions, use the special navigate handler
       if (action.type === 'NAVIGATE') {
         await this.navigate(action.payload.url);
@@ -221,6 +238,18 @@ class BackgroundService {
               break;
             case 'SCROLL':
               await this.executeInTab(this.targetTabId, 'scroll', action.payload);
+              break;
+            case 'HOVER':
+              await this.executeInTab(this.targetTabId, 'hover', action.payload);
+              break;
+            case 'STORE':
+              // Already handled by AIClient
+              break;
+            case 'PRINT':
+              // Already handled earlier in this function
+              break;
+            case 'NAVIGATE':
+              // Already handled earlier in this function
               break;
             case 'COMPLETE':
               this.updateExecutionState({
@@ -301,6 +330,12 @@ class BackgroundService {
         return `Submitting form "${action.payload.selector}"`;
       case 'SCROLL':
         return `Scrolling ${action.payload.direction} by ${action.payload.amount}px`;
+      case 'HOVER':
+        return `Hovering over element "${action.payload.selector}"`;
+      case 'STORE':
+        return `Storing ${action.payload.append ? 'additional ' : ''}data`;
+      case 'PRINT':
+        return 'Displaying information to user';
       case 'COMPLETE':
         return 'Task completed successfully';
       case 'FAILED':

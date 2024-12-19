@@ -5,8 +5,12 @@ export type ActionType =
   | 'CLICK'
   | 'TYPE'
   | 'SUBMIT'
-  | 'COMPLETE'  // Added
-  | 'FAILED'    // Added
+  | 'COMPLETE' 
+  | 'FAILED'
+  | 'SCROLL'
+  | 'HOVER'
+  | 'STORE'
+  | 'PRINT'
 
 export interface AIAction {
   type: ActionType;
@@ -45,14 +49,20 @@ export interface ExecutionState {
 }
 
 export interface AIResponse {
-  action: AIAction;        // Changed from actions array to single action
+  action: AIAction;
   reasoning: string;
   completed: boolean;
   failed: boolean;
+  storedData?: StoredData;
 }
 
 export interface ExtensionSettings {
   aiProvider: 'openai' | 'local' | 'custom';
   apiEndpoint: string;
   apiKey: string;
+}
+
+export interface StoredData {
+  text: string;
+  timestamp: number;
 }

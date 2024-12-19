@@ -15,6 +15,9 @@ export class AIClient {
     timestamp: string;
     success: boolean;
   }> = [];
+  private currentStoredData: string = '';
+  private readonly MAX_STORED_LENGTH = 2000;  // ~2KB limit
+  private readonly MAX_PRINT_LENGTH = 2000;   // ~2KB limit
 
   constructor() {
     this.parser = new AIResponseParser();
@@ -67,6 +70,14 @@ export class AIClient {
   async getNextAction(task: string, pageState: PageState): Promise<AIResponse> {
     try {
       const provider = await this.getProvider();
+
+      // Log the task and current state
+      console.group('AI Request');
+      console.log('Task:', task);
+      console.log('Current URL:', pageState?.url);
+      console.log('Stored Data:', this.currentStoredData || 'None');
+      console.log('Action History:', this.actionHistory);
+      
       const messages = [
         { 
           role: 'system', 
@@ -80,10 +91,18 @@ Available actions:
 - SUBMIT: Submit a form (payload: { selector: string })
 - SCROLL: Scroll the page (payload: { direction: "up" | "down", amount: number })
 - HOVER: Hover over an element to reveal dropdown (payload: { selector: string })
+- STORE: Store text for later use (payload: { text: string, append: boolean })
+- PRINT: Display information to user (payload: { text: string })
 - COMPLETE: Mark the task as successfully completed (no payload)
 - FAILED: Mark the task as failed (payload: { reason: string })
 
-Note: You are seeing elements currently visible in the viewport. If you can't find what you're looking for, consider scrolling to reveal more content.
+Notes: 
+- If you find ALL the information the user is requesting use the PRINT action, not the STORE action. Only use STORE if you need collect information across multiple actions.
+- When working with search forms, always SUBMIT the form after typing
+- You are seeing elements currently visible in the viewport. If you can't find what you're looking for, consider scrolling to reveal more content.
+
+${this.currentStoredData ? `\nCurrently stored data:
+${this.currentStoredData}\n` : ''}
 
 ${this.actionHistory.length > 0 ? `\nPrevious actions in this session:
 ${this.formatActionHistory()}\n` : ''}
@@ -108,11 +127,32 @@ Available Elements: ${JSON.stringify(pageState.elements, null, 2)}`
       ];
 
       const rawResponse = await provider.generateCompletion(messages);
+
+      // Log the raw AI response
+      console.log('Raw AI Response:', rawResponse);
+      
       const parsedResponse = this.parser.parse(rawResponse);
       
-      // Add to history after successful parsing
-      this.addToHistory(parsedResponse, true);
+      // Handle STORE and PRINT actions
+      if (parsedResponse.action.type === 'STORE') {
+        const newText = this.validateStoredData(parsedResponse.action.payload.text);
+        if (parsedResponse.action.payload.append && this.currentStoredData) {
+          this.currentStoredData += '\n' + newText;
+        } else {
+          this.currentStoredData = newText;
+        }
+        parsedResponse.storedData = {
+          text: this.currentStoredData,
+          timestamp: Date.now()
+        };
+      } else if (parsedResponse.action.type === 'PRINT') {
+        parsedResponse.action.payload.text = this.validatePrintData(parsedResponse.action.payload.text);
+      } else if (parsedResponse.action.type === 'COMPLETE' || parsedResponse.action.type === 'FAILED') {
+        // Clear stored data when task completes or fails
+        this.currentStoredData = '';
+      }
       
+      this.addToHistory(parsedResponse, true);
       return parsedResponse;
     } catch (error) {
       // If there was a parsed response before the error, mark it as failed
@@ -124,4 +164,27 @@ Available Elements: ${JSON.stringify(pageState.elements, null, 2)}`
       throw error;
     }
   }
+
+  private validateStoredData(text: string): string {
+    if (text.length > this.MAX_STORED_LENGTH) {
+      console.warn('Stored data exceeds maximum length, truncating...', {
+        original: text.length,
+        truncated: this.MAX_STORED_LENGTH
+      });
+      return text.slice(0, this.MAX_STORED_LENGTH);
+    }
+    return text;
+  }
+
+  private validatePrintData(text: string): string {
+    if (text.length > this.MAX_PRINT_LENGTH) {
+      console.warn('Print data exceeds maximum length, truncating...', {
+        original: text.length,
+        truncated: this.MAX_PRINT_LENGTH
+      });
+      return text.slice(0, this.MAX_PRINT_LENGTH);
+    }
+    return text;
+  }
+  
 }

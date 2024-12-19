@@ -63,15 +63,35 @@ export class DOMExtractor {
 
   private extractElementInfo(element: Element): PageElement {
     const isInteractive = this.isInteractiveElement(element);
+    const isForm = element instanceof HTMLFormElement;
     
     return {
       type: element.tagName.toLowerCase(),
       text: this.getVisibleText(element),
-      attributes: isInteractive ? this.getRelevantAttributes(element) : {},
-      isVisible: true, // We've already filtered hidden elements
+      attributes: isInteractive || isForm ? this.getRelevantAttributes(element) : {},
+      isVisible: true,
       path: this.generateSelector(element),
       isInteractive,
-      value: this.getElementValue(element) // Add current input value
+      value: this.getElementValue(element),
+      formState: isForm ? this.getFormState(element) : undefined
+    };
+  }
+
+  private getFormState(form: HTMLFormElement): Record<string, any> {
+    const formData: Record<string, any> = {};
+    const inputs = form.querySelectorAll('input, textarea, select');
+    
+    inputs.forEach(input => {
+      if (input instanceof HTMLInputElement || 
+          input instanceof HTMLTextAreaElement || 
+          input instanceof HTMLSelectElement) {
+        formData[input.name || input.id || input.type] = input.value;
+      }
+    });
+    
+    return {
+      isSubmitted: false,  // Forms start unsubmitted
+      pendingInputs: formData
     };
   }
 
