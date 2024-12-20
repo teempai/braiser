@@ -66,7 +66,14 @@ class ContentScript {
         }
       };
   
-      processMessage();
+      processMessage().then(() => {
+        // Ensure sendResponse is called
+        // This is already handled in your existing code
+      }).catch(error => {
+        console.error('Error in content script:', error);
+        sendResponse({ success: false, error: error.message });
+      });
+      
       return true; // Will respond asynchronously
     });
   
@@ -310,4 +317,7 @@ async function handleHover(payload: { selector: string }) {
 (async () => {
   console.log('Content script initializing...');
   const contentScript = new ContentScript();
+
+  // Notify background script that content script is ready
+  chrome.runtime.sendMessage({ type: 'CONTENT_SCRIPT_READY' });
 })();

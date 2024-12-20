@@ -36,17 +36,20 @@ export function TaskHistory({ tasks }: TaskHistoryProps) {
         // Get all logs and filter out AI responses
         const actionLogs = task.logs
           .filter(log => 
+            log.message && // Check if log.message exists
             !log.message.startsWith('AI Response:') &&
             !log.message.startsWith('AI Reasoning:')
           )
           .map(log => ({
             ...log,
             // Format start and failed messages
-            message: log.message.startsWith('Starting task:') 
-              ? formatStartingMessage(log.message)
-              : log.message.startsWith('{') && log.message.includes('"reason"')
-                ? formatFailedMessage(log.message)
-                : log.message
+            message: log.message
+              ? log.message.startsWith('Starting task:') 
+                ? formatStartingMessage(log.message)
+                : log.message.startsWith('{') && log.message.includes('"reason"')
+                  ? formatFailedMessage(log.message)
+                  : log.message
+              : '' // Default to empty string if log.message is undefined
           }))
           .reverse(); // Reverse the logs array to show newest first
 

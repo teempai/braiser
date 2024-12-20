@@ -7,16 +7,23 @@ class BackgroundService {
   private storage: StorageManager;
   private windowId: number | null = null;
   private targetTabId: number | null = null;
+  private targetTabUrl: string | null = null;
+  private _pageStateUpdateTimeout: number | null = null;
   private executionState: ExecutionState = {
     status: 'idle',
     currentStep: 0,
     totalSteps: 0,
     logs: []
   };
+  
   private currentTask: {
     prompt: string;
   } | null = null;
   private lastPageState: PageState | null = null;
+  private lastActionResult: { success: boolean; error?: string } = { success: true };
+  private contentScriptReadyTabs: Set<number> = new Set();
+  private errorCount: number = 0;
+  private readonly MAX_ERRORS: number = 5; // Set your desired maximum number of errors
 
   constructor() {
     this.aiClient = new AIClient();
@@ -25,6 +32,7 @@ class BackgroundService {
   }
 
   private initializeListeners() {
+    // Listener for the extension icon click
     chrome.action.onClicked.addListener(async (tab) => {
       console.log('Extension clicked on tab:', tab);
   
@@ -62,45 +70,49 @@ class BackgroundService {
   
     chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       console.log('Background received message:', message);
-      
-      (async () => {
+  
+      // Handle CONTENT_SCRIPT_READY message
+      if (message.type === 'CONTENT_SCRIPT_READY' && sender.tab?.id) {
+        console.log(`Content script ready in tab ${sender.tab.id}`);
+        this.contentScriptReadyTabs.add(sender.tab.id);
+        sendResponse({ success: true });
+        return; // Early return to avoid processing other message types
+      }
+  
+      // Async function to handle other messages
+      const handleMessage = async () => {
         try {
           switch (message.type) {
             case 'START_TASK':
               await this.handleNewTask(message.prompt);
-              sendResponse({ success: true });
+              return { success: true };
               break;
               
             case 'PAGE_STATE_UPDATE':
               await this.handlePageStateUpdate(message.state);
-              sendResponse({ success: true });
+              return { success: true };
               break;
               
             case 'EXECUTION_STOP':
               this.stopExecution();
-              sendResponse({ success: true });
+              return { success: true };
               break;
-  
+
             default:
               console.warn('Unknown message type:', message.type);
               sendResponse({ success: false, error: 'Unknown message type' });
           }
         } catch (error) {
           console.error('Error handling message:', error);
-          const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-          sendResponse({ success: false, error: errorMessage });
-          this.updateExecutionState({
-            status: 'error',
-            error: errorMessage,
-            logs: [...this.executionState.logs, {
-              type: 'error',
-              message: errorMessage,
-              timestamp: new Date().toISOString()
-            }]
-          });
+          return { 
+            success: false, 
+            error: error instanceof Error ? error.message : 'Unknown error' 
+          };
         }
-      })();
-      
+      };
+    
+      // Handle the async response properly
+      handleMessage().then(sendResponse);
       return true;
     });
   }
@@ -136,47 +148,35 @@ class BackgroundService {
     });
   }
 
-  private async handleNewTask(prompt: string) {
-    if (this.executionState.status === 'running') {
-      throw new Error('A task is already running.');
+  private async handleNewTask(prompt: string): Promise<void> {
+    this.stopExecution(); // Stop any existing execution
+  
+    this.executionState = {
+      status: 'running',
+      currentStep: 0,
+      totalSteps: 0,
+      logs: []
+    };
+  
+    this.currentTask = { prompt };
+    this.errorCount = 0; // Reset error count when starting a new task
+  
+    await this.requestNextAction();
+  }
+
+  private async reinjectContentScript(): Promise<void> {
+    if (!this.targetTabId) {
+      throw new Error('No target tab found');
     }
   
     try {
-      if (!this.targetTabId) {
-        throw new Error('No target tab found');
-      }
-  
-      // Reset state for new task
-      this.currentTask = { prompt };
-      this.lastPageState = null;
-  
-      const response = await this.aiClient.getNextAction(prompt, this.lastPageState);
-      
-      if (!response.action) {
-        throw new Error('No action received from AI');
-      }
-  
-      this.currentTask = {
-        prompt,
-        actions: [response.action],
-        currentActionIndex: 0
-      };
-  
-      this.updateExecutionState({
-        status: 'running',
-        currentStep: 1,
-        totalSteps: 1,
-        currentAction: response.action,
-        logs: [{
-          type: 'info',
-          message: `Starting task: ${prompt}\nAI Reasoning: ${response.reasoning || 'No reasoning provided'}`,
-          timestamp: new Date().toISOString()
-        }]
+      await chrome.scripting.executeScript({
+        target: { tabId: this.targetTabId },
+        files: ['content/content.js']
       });
-  
-      await this.executeAction(response.action);
+      console.log('Content script reinjected successfully');
     } catch (error) {
-      console.error('Error starting task:', error);
+      console.error('Failed to reinject content script:', error);
       throw error;
     }
   }
@@ -186,24 +186,81 @@ class BackgroundService {
       throw new Error('No target tab found');
     }
   
-    try {
-      // Log the action we're about to execute
-      this.updateExecutionState({
-        currentAction: action,
-        logs: [...this.executionState.logs, {
-          type: 'info',
-          message: this.getActionDescription(action),
-          timestamp: new Date().toISOString()
-        }]
-      });
+    let success = false;
+    let lastError: any = null;
   
-      // Handle new actions
-      if (action.type === 'STORE') {
-        // STORE is handled by AIClient, no need for additional processing
+    try {
+      // Update execution state
+      this.executionState.currentStep += 1;
+      this.executionState.logs.push(`Executing action: ${action.type}`);
+  
+      await this.performAction(action);
+  
+      success = true;
+      // Reset error count on success
+      this.errorCount = 0;
+    } catch (error) {
+      console.error('Error executing action:', error);
+      lastError = error;
+      success = false;
+  
+      // Increment error count on failure
+      this.errorCount += 1;
+  
+      // Check if error count exceeds maximum allowed
+      if (this.errorCount >= this.MAX_ERRORS) {
+        console.error('Maximum error limit reached. Stopping execution.');
+  
+        // Update execution state to indicate failure
+        this.executionState.status = 'failed';
+        this.executionState.logs.push('Task failed due to too many errors.');
+  
+        // Optionally, send a notification to the user or UI component
+        // You can implement a method to update the UI if necessary
+        // this.notifyTaskFailed('Task failed due to too many errors.');
+  
+        // Stop execution
+        this.stopExecution();
         return;
       }
+    }
   
-      if (action.type === 'PRINT') {
+    // Report the result back to the AI client
+    this.lastActionResult = { success, error: lastError ? lastError.message : undefined };
+  
+    // Request next action from AI client if execution has not stopped
+    if (this.executionState.status === 'running') {
+      // Continue execution
+      await this.requestNextAction();
+    }
+  }
+
+  private async performAction(action: AIAction) {
+    // Include the action execution logic here (similar to your existing code)
+    // For example:
+    switch (action.type) {
+      case 'CLICK':
+        await this.executeInTab(this.targetTabId, 'click', action.payload);
+        break;
+      case 'TYPE':
+        await this.executeInTab(this.targetTabId, 'type', action.payload);
+        break;
+      case 'SUBMIT':
+        await this.executeInTab(this.targetTabId, 'submit', action.payload);
+        break;
+      case 'SCROLL':
+        await this.executeInTab(this.targetTabId, 'scroll', action.payload);
+        break;
+      case 'HOVER':
+        await this.executeInTab(this.targetTabId, 'hover', action.payload);
+        break;
+      case 'STORE':
+        // Already handled by AIClient
+        break;
+      case 'NAVIGATE':
+        await this.navigate(action.payload.url);
+        break;
+      case 'PRINT':
         this.updateExecutionState({
           logs: [...this.executionState.logs, {
             type: 'info',
@@ -211,110 +268,126 @@ class BackgroundService {
             timestamp: new Date().toISOString()
           }]
         });
-        return;
-      }
-  
-      // For navigation actions, use the special navigate handler
-      if (action.type === 'NAVIGATE') {
-        await this.navigate(action.payload.url);
-        return;
-      }
-  
-      // For other actions, try to execute with retry logic
-      let attempts = 0;
-      const maxAttempts = 3;
-      
-      while (attempts < maxAttempts) {
-        try {
-          switch (action.type) {
-            case 'CLICK':
-              await this.executeInTab(this.targetTabId, 'click', action.payload);
-              break;
-            case 'TYPE':
-              await this.executeInTab(this.targetTabId, 'type', action.payload);
-              break;
-            case 'SUBMIT':
-              await this.executeInTab(this.targetTabId, 'submit', action.payload);
-              break;
-            case 'SCROLL':
-              await this.executeInTab(this.targetTabId, 'scroll', action.payload);
-              break;
-            case 'HOVER':
-              await this.executeInTab(this.targetTabId, 'hover', action.payload);
-              break;
-            case 'STORE':
-              // Already handled by AIClient
-              break;
-            case 'PRINT':
-              // Already handled earlier in this function
-              break;
-            case 'NAVIGATE':
-              // Already handled earlier in this function
-              break;
-            case 'COMPLETE':
-              this.updateExecutionState({
-                status: 'idle',
-                logs: [...this.executionState.logs, {
-                  type: 'info',
-                  message: 'Task completed successfully',
-                  timestamp: new Date().toISOString()
-                }]
-              });
-              break;
-            case 'FAILED':
-              this.updateExecutionState({
-                status: 'error',
-                error: action.payload?.reason || 'Task failed',
-                logs: [...this.executionState.logs, {
-                  type: 'error',
-                  message: action.payload?.reason || 'Task failed',
-                  timestamp: new Date().toISOString()
-                }]
-              });
-              break;
-            default:
-              throw new Error(`Unsupported action type: ${action.type}`);
-          }
-          // If we get here, the action succeeded
-          return;
-        } catch (error) {
-          attempts++;
-          if (attempts === maxAttempts) {
-            throw error;
-          }
-          
-          // Wait before retrying and reinject content script
-          await new Promise(resolve => setTimeout(resolve, 1000));
-          try {
-            await this.reinjectContentScript();
-          } catch (e) {
-            console.warn('Failed to reinject content script:', e);
-          }
-        }
-      }
-    } catch (error) {
-      console.error('Error executing action:', error);
-      throw error;
+        break;
+      case 'COMPLETE':
+        this.updateExecutionState({
+          status: 'idle',
+          logs: [...this.executionState.logs, {
+            type: 'info',
+            message: 'Task completed successfully',
+            timestamp: new Date().toISOString()
+          }]
+        });
+        break;
+      case 'FAILED':
+        this.updateExecutionState({
+          status: 'error',
+          error: action.payload?.reason || 'Task failed',
+          logs: [...this.executionState.logs, {
+            type: 'error',
+            message: action.payload?.reason || 'Task failed',
+            timestamp: new Date().toISOString()
+          }]
+        });
+        break;
     }
   }
 
-  private async reinjectContentScript(): Promise<void> {
-    if (!this.targetTabId) return;
-  
+  private async requestNextAction(): Promise<void> {
+    if (!this.currentTask) {
+      console.warn('No current task.');
+      return;
+    }
+
     try {
-      await chrome.scripting.executeScript({
-        target: { tabId: this.targetTabId },
-        files: ['content/content.js']
-      });
-      
-      // Give the content script time to initialize
-      await new Promise(resolve => setTimeout(resolve, 500));
-      
-      // Request initial page state
-      await this.executeInTab(this.targetTabId, 'get_page_state', {});
+      // Get next action from AI based on current state
+      const response = await this.aiClient.getNextAction(
+        this.currentTask.prompt,
+        this.lastPageState,
+        this.lastActionResult
+      );
+
+      if (response.action) {
+        // Update execution state with new action
+        this.updateExecutionState({
+          currentAction: response.action,
+          logs: [
+            ...this.executionState.logs,
+            {
+              type: 'info',
+              message: `AI Response: ${response.reasoning}`,
+              timestamp: new Date().toISOString()
+            }
+          ]
+        });
+
+        // Execute the next action
+        await this.executeAction(response.action);
+      } else if (response.completed) {
+        this.updateExecutionState({
+          status: 'idle',
+          logs: [
+            ...this.executionState.logs,
+            {
+              type: 'info',
+              message: 'Task completed successfully',
+              timestamp: new Date().toISOString()
+            }
+          ]
+        });
+        this.currentTask = null;
+      }
     } catch (error) {
-      console.warn('Error reinjecting content script:', error);
-      throw error;
+      console.error('Error requesting next action:', error);
+      // Handle error, possibly update execution state
+    }
+  }
+
+  private async requestPageStateUpdate() {
+    await this.executeInTab(this.targetTabId!, 'get_page_state', {});
+  }
+  
+  private async handleActionFailure() {
+    // Inform the AI client that the last action failed, allowing it to adjust
+    const response = await this.aiClient.getNextAction(
+      this.currentTask!.prompt,
+      this.lastPageState,
+      this.lastActionResult
+    );
+  
+    // Proceed with handling the AI's response
+    await this.handleAIResponse(response);
+  }
+  
+  private async handleAIResponse(response: AIResponse) {
+    if (response.action) {
+      this.updateExecutionState({
+        currentAction: response.action,
+        logs: [
+          ...this.executionState.logs,
+          {
+            type: 'info',
+            message: `AI Response: ${response.reasoning}`,
+            timestamp: new Date().toISOString()
+          }
+        ]
+      });
+  
+      // Execute the next action
+      await this.executeAction(response.action);
+    } else if (response.completed) {
+      this.updateExecutionState({
+        status: 'idle',
+        logs: [
+          ...this.executionState.logs,
+          {
+            type: 'info',
+            message: 'Task completed successfully',
+            timestamp: new Date().toISOString()
+          }
+        ]
+      });
+      this.currentTask = null;
     }
   }
 
@@ -346,56 +419,61 @@ class BackgroundService {
   }
   
   private async handlePageStateUpdate(state: PageState) {
-    this.lastPageState = state;
-    console.log('Received page state update:', state);
-    
-    // Only proceed if we have an active task
-    if (this.currentTask && this.executionState.status === 'running') {
+    if (this._pageStateUpdateTimeout) {
+      clearTimeout(this._pageStateUpdateTimeout);
+    }
+  
+    this._pageStateUpdateTimeout = setTimeout(async () => {
       try {
-        // Get next action from AI based on current state
-        const response = await this.aiClient.getNextAction(
-          this.currentTask.prompt,
-          this.lastPageState
-        );
+        this.lastPageState = state;
+        console.log('Received page state update:', state);
+        
+        // Only proceed if we have an active task
+        if (this.currentTask && this.executionState.status === 'running') {
+          // Get next action from AI based on current state
+          const response = await this.aiClient.getNextAction(
+            this.currentTask.prompt,
+            this.lastPageState,
+            this.lastActionResult
+          );
   
-        if (response.action) {
-          // Update execution state with new action
-          this.updateExecutionState({
-            currentAction: response.action,
-            logs: [
-              ...this.executionState.logs,
-              {
-                type: 'info',
-                message: `AI Response: ${response.reasoning}`,
-                timestamp: new Date().toISOString()
-              }
-            ]
-          });
+          if (response.action) {
+            // Update execution state with new action
+            this.updateExecutionState({
+              currentAction: response.action,
+              logs: [
+                ...this.executionState.logs,
+                {
+                  type: 'info',
+                  message: `AI Response: ${response.reasoning}`,
+                  timestamp: new Date().toISOString()
+                }
+              ]
+            });
   
-          // Execute the next action
-          await this.executeAction(response.action);
-        } else if (response.completed) {
-          this.updateExecutionState({
-            status: 'idle',
-            logs: [
-              ...this.executionState.logs,
-              {
-                type: 'info',
-                message: 'Task completed successfully',
-                timestamp: new Date().toISOString()
-              }
-            ]
-          });
-          this.currentTask = null;
+            // Execute the next action
+            await this.executeAction(response.action);
+          } else if (response.completed) {
+            this.updateExecutionState({
+              status: 'idle',
+              logs: [
+                ...this.executionState.logs,
+                {
+                  type: 'info',
+                  message: 'Task completed successfully',
+                  timestamp: new Date().toISOString()
+                }
+              ]
+            });
+            this.currentTask = null;
+          }
         }
       } catch (error) {
         console.error('Error processing page state update:', error);
-        this.updateExecutionState({
-          status: 'error',
-          error: error instanceof Error ? error.message : 'Unknown error'
-        });
+      } finally {
+        this._pageStateUpdateTimeout = null;
       }
-    }
+    }, 500);
   }
 
   private async navigate(url: string): Promise<void> {
@@ -406,38 +484,25 @@ class BackgroundService {
     return new Promise((resolve, reject) => {
       const timeout = setTimeout(() => {
         reject(new Error('Navigation timeout'));
-      }, 10000); // Increased timeout
+      }, 15000); // Increased timeout
   
-      // Wait for navigation to complete
       const onUpdatedListener = async (tabId: number, info: chrome.tabs.TabChangeInfo) => {
         if (tabId === this.targetTabId && info.status === 'complete') {
           chrome.tabs.onUpdated.removeListener(onUpdatedListener);
-          
+          clearTimeout(timeout);
           try {
-            // Inject content script
-            await chrome.scripting.executeScript({
-              target: { tabId: this.targetTabId },
-              files: ['content/content.js'] // Make sure this matches your build output
-            });
-  
-            // Give the content script time to initialize
-            await new Promise(resolve => setTimeout(resolve, 1000));
-            
-            // Request page state explicitly
-            await this.executeInTab(this.targetTabId, 'get_page_state', {});
-            
-            clearTimeout(timeout);
+            // Wait for page to finish loading
+            await new Promise(resolve => setTimeout(resolve, 2000)); // Adjust delay as needed
+            await this.reinjectContentScript();
             resolve();
           } catch (error) {
-            clearTimeout(timeout);
             reject(error);
           }
         }
       };
   
       chrome.tabs.onUpdated.addListener(onUpdatedListener);
-      
-      // Start the navigation
+  
       chrome.tabs.update(this.targetTabId, { url }, (tab) => {
         if (chrome.runtime.lastError) {
           clearTimeout(timeout);
@@ -448,23 +513,57 @@ class BackgroundService {
   }
 
   private async executeInTab(tabId: number, action: string, payload: any): Promise<void> {
-    return new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => {
-        reject(new Error('Action timeout'));
-      }, 5000);
-  
-      chrome.tabs.sendMessage(tabId, { type: action, payload }, response => {
-        clearTimeout(timeout);
-        
-        if (chrome.runtime.lastError) {
-          reject(chrome.runtime.lastError);
-        } else if (!response?.success) {
-          reject(new Error(response?.error || 'Action failed'));
-        } else {
-          resolve();
-        }
+    if (!this.contentScriptReadyTabs.has(tabId)) {
+      console.log(`Waiting for content script to be ready in tab ${tabId}`);
+      await new Promise<void>((resolve, reject) => {
+        const timeout = setTimeout(() => {
+          reject(new Error('Content script did not become ready in time'));
+        }, 5000);
+
+        const interval = setInterval(() => {
+          if (this.contentScriptReadyTabs.has(tabId)) {
+            clearTimeout(timeout);
+            clearInterval(interval);
+            resolve();
+          }
+        }, 100);
       });
-    });
+    }
+    const sendMessage = (): Promise<void> => {
+      return new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => {
+          reject(new Error('Action timeout'));
+        }, 5000);
+  
+        chrome.tabs.sendMessage(tabId, { type: action, payload }, response => {
+          clearTimeout(timeout);
+  
+          if (chrome.runtime.lastError) {
+            // Check for specific error indicating missing content script
+            if (chrome.runtime.lastError.message.includes('Receiving end does not exist')) {
+              console.warn('Content script not found in tab. Attempting to inject.');
+              this.reinjectContentScript()
+                .then(() => {
+                  // Try sending the message again after re-injection
+                  sendMessage().then(resolve).catch(reject);
+                })
+                .catch(err => {
+                  reject(err);
+                });
+            } else {
+              reject(chrome.runtime.lastError);
+            }
+          } else if (!response?.success) {
+            reject(new Error(response?.error || 'Action failed'));
+          } else {
+            resolve();
+          }
+        });
+      });
+    };
+  
+    // Start by sending the message
+    return sendMessage();
   }
 
   private updateExecutionState(updates: Partial<ExecutionState>) {
@@ -485,23 +584,10 @@ class BackgroundService {
   }
 
   private stopExecution() {
-    this.currentTask = null;
-    this.executionState = {
-      status: 'idle',
-      currentStep: 0,
-      totalSteps: 0,
-      logs: [
-        ...this.executionState.logs,
-        {
-          type: 'info',
-          message: 'Task execution stopped by user',
-          timestamp: new Date().toISOString(),
-        },
-      ],
-    };
-    this.lastPageState = null;
+    this.executionState.status = 'idle';
+    this.errorCount = 0; // Reset error count when stopping execution
   }
-}
+} 
 
 // Initialize the background service
 const backgroundService = new BackgroundService();

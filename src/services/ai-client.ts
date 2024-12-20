@@ -44,30 +44,33 @@ export class AIClient {
       action: response.action,
       reasoning: response.reasoning,
       timestamp: new Date().toISOString(),
-      success
+      success,
+      error: success ? undefined : response.error
     });
-
-    // Keep only last 10 actions
+  
+    // Keep only the last 10 actions
     if (this.actionHistory.length > 10) {
       this.actionHistory.shift();
     }
   }
-
+  
   private formatActionHistory(): string {
-    if (this.actionHistory.length === 0) return '';
-
     return this.actionHistory
-      .map(({ action, reasoning, success }, index) => {
-        const status = success ? '✓' : '✗';
+      .map(({ action, reasoning, success, error }, index) => {
+        const status = success ? 'Success' : `Failed: ${error}`;
         const actionStr = action.payload 
           ? `${action.type}(${JSON.stringify(action.payload)})`
           : action.type;
-        return `${index + 1}. ${status} ${actionStr} - ${reasoning}`;
+        return `${index + 1}. [${status}] ${actionStr} - ${reasoning}`;
       })
       .join('\n');
   }
 
-  async getNextAction(task: string, pageState: PageState): Promise<AIResponse> {
+  async getNextAction(
+      task: string,
+      pageState: PageState,
+      lastActionResult?: { success: boolean; error?: string }
+  ): Promise<AIResponse> {
     try {
       const provider = await this.getProvider();
 
@@ -106,6 +109,8 @@ ${this.currentStoredData}\n` : ''}
 
 ${this.actionHistory.length > 0 ? `\nPrevious actions in this session:
 ${this.formatActionHistory()}\n` : ''}
+
+${lastActionResult ? `\nThe last action ${lastActionResult.success ? 'succeeded' : `failed with error: ${lastActionResult.error}`}` : ''}
 
 Respond with a JSON object containing:
 {
